@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Audio to Image & Vice Versa (Odd Bits Edition)</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    :root{--bg:#000;--accent:#00ff88;--panel:#001f1a}
+    body { background:var(--bg); color:var(--accent); font-family:'Courier New',monospace; margin:0; padding:20px; }
+    h1{margin:0 0 8px}
+    .wrap { display:flex; gap:16px; align-items:flex-start; flex-wrap:wrap; }
+    .pane { flex:1 1 420px; background:var(--panel); border:1px solid var(--accent); padding:14px; box-sizing:border-box; }
+    label, select, input, button, a { display:block; margin:8px 0; color:var(--accent); background:transparent; border:1px solid var(--accent); padding:8px; font-family:inherit; }
+    #logLeft,#logRight { white-space:pre-wrap; background:#00000010; border:1px solid var(--accent); padding:8px; height:220px; overflow:auto; font-size:12px; }
+    button { cursor:pointer; }
+    .row { display:flex; gap:8px; align-items:center; }
+    canvas { display:none; }
+    .metaSmall { font-size:12px; color:#88ffbb88; margin-top:6px; }
+  </style>
+</head>
+<body>
+
+<h1>audio ↔ image converter</h1>
+
+<div class="wrap">
+  <div class="pane" id="leftPane">
+    <h2>audio to image</h2>
+    <input id="audioInput" type="file" accept="audio/*">
+    
+    <label>sample rate
+      <select id="srSelectLeft">
+        <option value="1000">1000 Hz (ultra lo-fi)</option>
+        <option value="2000">2000 Hz</option>
+        <option value="4000">4000 Hz</option>
+        <option value="8000">8000 Hz</option>
+        <option value="16000">16000 Hz</option>
+        <option value="22050">22050 Hz</option>
+        <option value="44100" selected>44100 Hz</option>
+      </select>
+    </label>
+
+    <label>bit depth
+      <select id="bdSelectLeft">
+        <option value="1">1 (binary)</option>
+        <option value="2">2 (lo-fi)</option>
+        <option value="3">3 (odd bit)</option>
+        <option value="4">4 (quantized)</option>
+        <option value="5">5 (odd bit)</option>
+        <option value="6">6 (odd bit)</option>
+        <option value="8" selected>8 (µ-law)</option>
+        <option value="16">16 (linear PCM)</option>
+      </select>
+    </label>
+
+    <div class="row">
+      <button id="encodeBtn">convert → image</button>
+      <a id="downloadImg" style="display:none" download>download image</a>
+    </div>
+    <div id="logLeft"></div>
+  </div>
+
+  <div class="pane" id="rightPane">
+    <h2>image to audio</h2>
+    <input id="imageInput" type="file" accept="image/*">
+    <div class="row">
+      <button id="decodeBtn">decode & play</button>
+      <a id="downloadWav" style="display:none" download>download wav</a>
+    </div>
+    <div id="logRight"></div>
+    <canvas id="oscilloscope" width="550" height="150" style="border:1px solid var(--accent); margin-top:10px; display:block;"></canvas>
+  </div>
+</div>
+
+<canvas id="workCanvas"></canvas>
+
+<script>
+/* ================= Utilities ================= */
+const logLeft = msg => { const el=document.getElementById('logLeft'); el.textContent+= msg + '\n'; el.scrollTop = el.scrollHeight; };
+const logRight = msg => { const el=document.getElementById('logRight'); el.textContent+= msg + '\n'; el.scrollTop = el.scrollHeight; };
+function writeUint32BE(arr, offset, value){ arr[offset]=(value>>>24)&0xFF; arr[offset+1]=(value>>>16)&0xFF; arr[offset+2]=(value>>>8)&0xFF; arr[offset+3]=value&0xFF; }
+function readUint32BE(arr, offset){ return ((arr[offset]<<24)>>>0)+(arr[offset+1]<<16)+(arr[offset+2]<<8)+arr[offset+3]; }
+
+/* ================= µ-law ================= */
+function linearToMuLawByte(x){ const mu=255; const sign=x<0?-1:1; const absx=Math.min(1,Math.abs(x)); const y=Math.log(1+mu*absx)/Math.log(1+mu); return Math.round((sign*y*0.5+0.5)*255)&0xFF; }
+function muLawByteToLinear(b){ const mu=255; const comp=(b/255)*2-1; const sign=comp<0?-1:1; const absC=Math.abs(comp); return Math.max(-1,Math.min(1,sign*((Math.pow(1+mu,absC)-1)/mu))); }
+
+/* ================= Delta & RLE ================= */
+function deltaEncode(bytes){ const out=new Uint8Array(bytes.length); let prev=128; for(let i=0;i<bytes.length;i++){ out[i]=(bytes[i]-prev)&0xFF; prev=bytes[i]; } return out; }
+function deltaDecode(bytes){ const out=new Uint8Array(bytes.length); let prev=128; for(let i=0;i<bytes.length;i++){ const val=(prev+bytes[i])&0xFF; out[i]=val; prev=val; } return out; }
+function rleEncode(bytes){ const out=[]; let i=0; while(i<bytes.length){ const v=bytes[i]; let count=1; while(i+count<bytes.length&&bytes[i+count]===v&&count<255)count++; out.push(count,v); i+=count; } return new Uint8Array(out); }
+function rleDecode(bytes){ const out=[]; for(let i=0;i<bytes.length;i+=2){ const count=bytes[i]; const val=bytes[i+1]; for(let k=0;k<count;k++) out.push(val); } return new Uint8Array(out); }
+
+/* ================= WAV Export ================= */
+function createWavBlob(samplesFloat32,sampleRate){
+    const dataSize=samplesFloat32.length*2; const buffer=new ArrayBuffer(44+dataSize); const view=new DataView(buffer);
+    const writeS=(o,s)=>{for(let i=0;i<s.length;i++)view.setUint8(o+i,s.charCodeAt(i))};
+    writeS(0,'RIFF'); view.setUint32(4,36+dataSize,true); writeS(8,'WAVE'); writeS(12,'fmt ');
+    view.setUint32(16,16,true); view.setUint16(20,1,true); view.setUint16(22,1,true);
+    view.setUint32(24,sampleRate,true); view.setUint32(28,sampleRate*2,true);
+    view.setUint16(32,2,true); view.setUint16(34,16,true); writeS(36,'data'); view.setUint32(40,dataSize,true);
+    for(let i=0;i<samplesFloat32.length;i++){ let s=Math.max(-1,Math.min(1,samplesFloat32[i])); view.setInt16(44+i*2,s<0?s*0x8000:s*0x7FFF,true); }
+    return new Blob([buffer],{type:'audio/wav'});
+}
+
+/* ================= ENCODER ================= */
+async function encodeAudioFileToImage(file,bitDepth,targetSR){
+    logLeft(`📥 Processing: ${file.name}`);
+    const ab = await file.arrayBuffer();
+    const actx = new (window.AudioContext||window.webkitAudioContext)();
+    const decBuf = await actx.decodeAudioData(ab);
+    const offline = new OfflineAudioContext(1, Math.ceil(decBuf.duration * targetSR), targetSR);
+    const src = offline.createBufferSource(); src.buffer = decBuf; src.connect(offline.destination); src.start(0);
+    const rendered = await offline.startRendering();
+    const frames = rendered.length;
+    const mono = rendered.getChannelData(0);
+
+    let bytes;
+    const bitMap = { 8:0, 16:2, 4:3, 2:4, 1:5, 3:6, 5:7, 6:8 };
+    const bitCode = bitMap[bitDepth] ?? 0;
+
+    if(bitDepth === 8){
+        bytes = new Uint8Array(frames); for(let i=0;i<frames;i++) bytes[i] = linearToMuLawByte(mono[i]);
+    } else if(bitDepth === 16){
+        bytes = new Uint8Array(frames*2);
+        for(let i=0;i<frames;i++){ const s=Math.max(-1,Math.min(1,mono[i])); const v=s<0?Math.round(s*0x8000)&0xFFFF:Math.round(s*0x7FFF)&0xFFFF; bytes[i*2]=(v>>>8)&0xFF; bytes[i*2+1]=v&0xFF; }
+    } else {
+        // Bit-streaming for 1, 2, 3, 4, 5, 6 bits
+        const totalBits = frames * bitDepth;
+        bytes = new Uint8Array(Math.ceil(totalBits / 8));
+        let bucket = 0, count = 0, bIdx = 0;
+        const maxQ = Math.pow(2, bitDepth) - 1;
+        for(let i=0; i<frames; i++){
+            const q = Math.round((mono[i]*0.5+0.5)*maxQ) & maxQ;
+            bucket = (bucket << bitDepth) | q;
+            count += bitDepth;
+            while(count >= 8){ bytes[bIdx++] = (bucket >> (count - 8)) & 0xFF; count -= 8; }
+        }
+        if(count > 0) bytes[bIdx] = (bucket << (8 - count)) & 0xFF;
+    }
+
+    const rle = rleEncode(deltaEncode(bytes));
+    const header = new Uint8Array(8);
+    header[0]=(targetSR>>>16)&0xFF; header[1]=(targetSR>>>8)&0xFF; header[2]=targetSR&0xFF;
+    header[3]=((bitCode&0xF)<<4)|1; writeUint32BE(header,4,frames);
+
+    const payload = new Uint8Array(header.length + rle.length);
+    payload.set(header,0); payload.set(rle,header.length);
+
+    const side = Math.ceil(Math.sqrt(Math.ceil(payload.length/3)+1));
+    const out = new Uint8ClampedArray(side*side*4); out.fill(255);
+    for(let i=0; i<payload.length; i++) {
+        const pixIdx = Math.floor(i/3); const chan = i%3;
+        out[pixIdx*4 + chan] = payload[i];
+    }
+
+    const canvas = document.getElementById('workCanvas'); canvas.width=side; canvas.height=side;
+    canvas.getContext('2d').putImageData(new ImageData(out,side,side),0,0);
+    logLeft(`🎨 Image Generated: ${side}x${side}`);
+    return new Promise(r=>canvas.toBlob(r,'image/png'));
+}
+
+/* ================= DECODER ================= */
+async function decodeImageToAudio(imgFile){
+    const img = new Image(); const url = URL.createObjectURL(imgFile);
+    await new Promise(r=>{img.onload=r; img.src=url;});
+    const canvas = document.getElementById('workCanvas'); canvas.width=img.width; canvas.height=img.height;
+    const ctx = canvas.getContext('2d'); ctx.drawImage(img,0,0);
+    const data = ctx.getImageData(0,0,img.width,img.height).data;
+    const payload = []; for(let i=0;i<data.length;i+=4) payload.push(data[i], data[i+1], data[i+2]);
+    const arr = new Uint8Array(payload);
+
+    const sr = ((arr[0]<<16)|(arr[1]<<8)|arr[2])>>>0 || 44100;
+    const bitCode = (arr[3]>>>4)&0xF;
+    const sampleCount = readUint32BE(arr, 4);
+    const bitMapRev = { 0:8, 2:16, 3:4, 4:2, 5:1, 6:3, 7:5, 8:6 };
+    const bitDepth = bitMapRev[bitCode] || 8;
+    const quantBytes = deltaDecode(rleDecode(arr.slice(8)));
+
+    let samples = new Float32Array(sampleCount);
+    if(bitDepth === 8){
+        for(let i=0;i<sampleCount;i++) samples[i] = muLawByteToLinear(quantBytes[i]);
+    } else if(bitDepth === 16){
+        for(let i=0;i<sampleCount;i++){ let v=(quantBytes[i*2]<<8)|quantBytes[i*2+1]; if(v&0x8000)v-=0x10000; samples[i]=v<0?v/0x8000:v/0x7FFF; }
+    } else {
+        let bucket = 0, count = 0, bIdx = 0;
+        const maxQ = Math.pow(2, bitDepth) - 1;
+        for(let i=0; i<sampleCount; i++){
+            while(count < bitDepth && bIdx < quantBytes.length){ bucket = (bucket << 8) | quantBytes[bIdx++]; count += 8; }
+            const q = (bucket >> (count - bitDepth)) & maxQ;
+            count -= bitDepth;
+            samples[i] = (q/maxQ)*2-1;
+        }
+    }
+
+    const actx = new (window.AudioContext||window.webkitAudioContext)({sampleRate:sr});
+    const buffer = actx.createBuffer(1, samples.length, sr); buffer.copyToChannel(samples,0);
+    const src = actx.createBufferSource(); src.buffer = buffer; 
+    
+    // Viz
+    const osc = document.getElementById('oscilloscope'); const oscCtx = osc.getContext('2d');
+    const analyser = actx.createAnalyser(); src.connect(analyser); analyser.connect(actx.destination);
+    const dArr = new Uint8Array(analyser.fftSize);
+    const draw = () => { requestAnimationFrame(draw); analyser.getByteTimeDomainData(dArr);
+        oscCtx.fillStyle='#001f1a'; oscCtx.fillRect(0,0,osc.width,osc.height); oscCtx.strokeStyle='#0f0'; oscCtx.beginPath();
+        let x=0; for(let i=0;i<dArr.length;i++){ const y=((dArr[i]-128)/128)*osc.height/2+osc.height/2; if(i===0)oscCtx.moveTo(x,y); else oscCtx.lineTo(x,y); x+=osc.width/dArr.length; }
+        oscCtx.stroke(); }; draw();
+
+    src.start(); logRight(`▶ Playing: ${sr}Hz, ${bitDepth}-bit`);
+    return createWavBlob(samples, sr);
+}
+
+/* ================= UI Events ================= */
+document.getElementById('encodeBtn').onclick = async () => {
+    const file = document.getElementById('audioInput').files[0]; if(!file) return;
+    const bd = parseInt(document.getElementById('bdSelectLeft').value);
+    const sr = parseInt(document.getElementById('srSelectLeft').value);
+    const blob = await encodeAudioFileToImage(file, bd, sr);
+    const a = document.getElementById('downloadImg'); a.href=URL.createObjectURL(blob);
+    a.download = file.name+".png"; a.style.display='block';
+};
+document.getElementById('decodeBtn').onclick = async () => {
+    const file = document.getElementById('imageInput').files[0]; if(!file) return;
+    const wav = await decodeImageToAudio(file);
+    const a = document.getElementById('downloadWav'); a.href=URL.createObjectURL(wav);
+    a.download = "decoded.wav"; a.style.display='block';
+};
+</script>
+</body>
+</html>
